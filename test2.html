@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Space Solver</title>
+
+    <style>
+      body {
+        margin: 0;
+        overflow: hidden;
+      }
+    </style>
+
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+          "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.19/+esm"
+        }
+      }
+    </script>
+  </head>
+
+  <body>
+    <script type="module">
+      import * as THREE from 'three'
+      import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
+      import GUI from 'lil-gui'
+
+      /***********************
+SCENE
+***********************/
+
+      const scene = new THREE.Scene()
+      scene.background = new THREE.Color(0x222222)
+
+      const camera = new THREE.PerspectiveCamera(
+        60,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      )
+
+      camera.position.set(140, 120, 140)
+
+      const renderer = new THREE.WebGLRenderer({ antialias: true })
+      renderer.setSize(window.innerWidth, window.innerHeight)
+      document.body.appendChild(renderer.domElement)
+
+      const controls = new OrbitControls(camera, renderer.domElement)
+
+      /***********************
+LIGHT
+***********************/
+
+      scene.add(new THREE.AmbientLight(0xffffff, 0.5))
+
+      const dirLight = new THREE.DirectionalLight(0xffffff, 1)
+      dirLight.position.set(100, 200, 100)
+      scene.add(dirLight)
+
+      scene.add(new THREE.GridHelper(300, 30))
+
+      /***********************
+PARAMETERS
+***********************/
+
+      const params = {
+        objectWidth: 36,
+        objectHeight: 30,
+        objectLength: 80,
+
+        hallAWidth: 60,
+        hallBWidth: 40,
+
+        doorWidth: 36,
+        doorHeight: 84,
+
+        elevatorWidth: 65,
+        elevatorLength: 98,
+        elevatorHeight: 96,
+
+        testFit,
+        findLargest,
+      }
+
+      /***********************
+GEOMETRY HELPERS
+***********************/
+
+      function projection2D(w, l, a) {
+        const width = Math.abs(w * Math.cos(a)) + Math.abs(l * Math.sin(a))
+
+        const depth = Math.abs(w * Math.sin(a)) + Math.abs(l * Math.cos(a))
+
+        return { width, depth }
+      }
+
+      function fitsCorner(box) {
+        for (let a = 0; a <= Math.PI / 2; a += 0.02) {
+          const p = projection2D(box.w, box.l, a)
+
+          if (p.width <= params.hallAWidth && p.depth <= params.hallBWidth) {
+            return true
+          }
+        }
+
+        return false
+      }
+
+      function fitsDoor(box) {
+        for (let a = 0; a <= Math.PI / 2; a += 0.02) {
+          const p = projection2D(box.w, box.l, a)
+
+          if (p.width <= params.doorWidth && box.h <= params.doorHeight) {
+            return true
+          }
+        }
+
+        return false
+      }
+
+      function fitsElevator(box) {
+        const floorDiag = Math.sqrt(params.elevatorWidth ** 2 + params.elevatorLength ** 2)
+
+        const boxDiag = Math.sqrt(box.w ** 2 + box.l ** 2)
+
+        return box.h <= params.elevatorHeight && boxDiag <= floorDiag
+      }
+
+      function canMove(box) {
+        return fitsDoor(box) && fitsCorner(box) && fitsElevator(box)
+      }
+
+      /***********************
+VISUAL OBJECT
+***********************/
+
+      let boxMesh
+
+      function createBox() {
+        if (boxMesh) scene.remove(boxMesh)
+
+        const geo = new THREE.BoxGeometry(
+          params.objectWidth,
+          params.objectHeight,
+          params.objectLength
+        )
+
+        const mat = new THREE.MeshStandardMaterial({
+          color: 0xff4444,
+        })
+
+        boxMesh = new THREE.Mesh(geo, mat)
+
+        boxMesh.position.y = params.objectHeight / 2
+        boxMesh.position.z = -80
+
+        scene.add(boxMesh)
+      }
+
+      createBox()
+
+      /***********************
+HALLWAYS
+***********************/
+
+      let hallA, hallB
+
+      function createHalls() {
+        if (hallA) scene.remove(hallA)
+        if (hallB) scene.remove(hallB)
+
+        const mat = new THREE.MeshStandardMaterial({
+          color: 0x666666,
+          transparent: true,
+          opacity: 0.25,
+        })
+
+        const geoA = new THREE.BoxGeometry(params.hallAWidth, 96, 120)
+
+        hallA = new THREE.Mesh(geoA, mat)
+        hallA.position.set(0, 48, -60)
+        scene.add(hallA)
+
+        const geoB = new THREE.BoxGeometry(params.hallBWidth, 96, 120)
+
+        hallB = new THREE.Mesh(geoB, mat)
+        hallB.rotation.y = Math.PI / 2
+        hallB.position.set(60, 48, 0)
+
+        scene.add(hallB)
+      }
+
+      createHalls()
+
+      /***********************
+TEST FIT
+***********************/
+
+      function testFit() {
+        const box = {
+          w: params.objectWidth,
+          h: params.objectHeight,
+          l: params.objectLength,
+        }
+
+        const ok = canMove(box)
+
+        boxMesh.material.color.set(ok ? 0x00ff00 : 0xff0000)
+
+        console.log('Fits:', ok)
+      }
+
+      /***********************
+SEARCH LARGEST OBJECT
+***********************/
+
+      function findLargest() {
+        let best = null
+        let bestVol = 0
+
+        for (let w = 10; w < 100; w += 2)
+          for (let h = 10; h < 100; h += 2)
+            for (let l = 10; l < 120; l += 2) {
+              const box = { w, h, l }
+
+              if (canMove(box)) {
+                const vol = w * h * l
+
+                if (vol > bestVol) {
+                  bestVol = vol
+                  best = box
+                }
+              }
+            }
+
+        console.log('Largest box:', best)
+
+        if (best) {
+          params.objectWidth = best.w
+          params.objectHeight = best.h
+          params.objectLength = best.l
+
+          controller.updateDisplay()
+          createBox()
+        }
+      }
+
+      /***********************
+GUI
+***********************/
+
+      const gui = new GUI()
+
+      const objFolder = gui.addFolder('Object')
+
+      objFolder.add(params, 'objectWidth', 10, 120).onChange(createBox)
+      objFolder.add(params, 'objectHeight', 10, 120).onChange(createBox)
+      objFolder.add(params, 'objectLength', 10, 140).onChange(createBox)
+
+      const hallFolder = gui.addFolder('Hallways')
+
+      hallFolder.add(params, 'hallAWidth', 20, 100).onChange(createHalls)
+      hallFolder.add(params, 'hallBWidth', 20, 100).onChange(createHalls)
+
+      const doorFolder = gui.addFolder('Door')
+
+      doorFolder.add(params, 'doorWidth', 20, 60)
+      doorFolder.add(params, 'doorHeight', 60, 100)
+
+      const elevFolder = gui.addFolder('Elevator')
+
+      elevFolder.add(params, 'elevatorWidth', 40, 100)
+      elevFolder.add(params, 'elevatorLength', 60, 140)
+      elevFolder.add(params, 'elevatorHeight', 80, 120)
+
+      gui.add(params, 'testFit')
+      gui.add(params, 'findLargest')
+
+      /***********************
+ANIMATION
+***********************/
+
+      function animate() {
+        requestAnimationFrame(animate)
+
+        renderer.render(scene, camera)
+      }
+
+      animate()
+
+      /***********************
+RESIZE
+***********************/
+
+      window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight
+
+        camera.updateProjectionMatrix()
+
+        renderer.setSize(window.innerWidth, window.innerHeight)
+      })
+    </script>
+  </body>
+</html>

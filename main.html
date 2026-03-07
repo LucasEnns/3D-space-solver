@@ -1,0 +1,833 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Moving Path Builder + Solver</title>
+
+    <style>
+      body {
+        margin: 0;
+        overflow: hidden;
+        font-family: Arial;
+      }
+
+      #panel {
+        position: absolute;
+        left: 10px;
+        top: 10px;
+        width: 280px;
+        background: #ffffffdd;
+        padding: 10px;
+        border-radius: 8px;
+      }
+
+      #segments {
+        max-height: 300px;
+        overflow: auto;
+        margin-top: 10px;
+      }
+
+      .segment {
+        border: 1px solid #ccc;
+        padding: 6px;
+        margin-bottom: 6px;
+      }
+
+      button {
+        margin: 2px;
+      }
+
+      input {
+        width: 60px;
+      }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+          "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.19/+esm"
+        }
+      }
+    </script>
+  </head>
+
+  <body>
+    <div id="panel">
+      <b>Path Builder</b>
+
+      <br /><br />
+
+      <button id="addDoor">Add Door</button>
+      <button id="addHall">Add Hallway</button>
+      <button id="addTurn">Add Turn</button>
+      <button id="addStair">Add Stair</button>
+      <button id="addElevator">Add Elevator</button>
+
+      <br /><br />
+
+      <button id="solve">Find Largest Box</button>
+      <button id="playAnim">Play Path</button>
+
+      <div id="stats" style="margin-top: 8px; font-size: 12px"></div>
+      <div id="boxResult" style="margin-top: 6px; font-size: 12px"></div>
+
+      <div id="segments"></div>
+    </div>
+
+    <script type="module">
+      import * as THREE from 'three'
+      import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
+      ////////////////////////////////////////////////////////////
+      // THREE SCENE
+      ////////////////////////////////////////////////////////////
+
+      const scene = new THREE.Scene()
+      scene.background = new THREE.Color(0xf0f0f0)
+
+      const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 2000)
+      camera.position.set(200, 150, 200)
+
+      const renderer = new THREE.WebGLRenderer({ antialias: true })
+      renderer.setSize(innerWidth, innerHeight)
+      document.body.appendChild(renderer.domElement)
+
+      const controls = new OrbitControls(camera, renderer.domElement)
+
+      scene.add(new THREE.GridHelper(500, 20))
+
+      const light = new THREE.DirectionalLight(0xffffff, 1)
+      light.position.set(200, 200, 200)
+      scene.add(light)
+
+      ////////////////////////////////////////////////////////////
+      // SEGMENT STORAGE
+      ////////////////////////////////////////////////////////////
+
+      let userSegments = []
+      let meshes = []
+      let testBox = null
+      let travelSamples = []
+      let animating = false
+      let animStart = 0
+      let animDurationMs = 7000
+      let solvedBox = null
+      const DEG = Math.PI / 180
+      const euler = new THREE.Euler(0, 0, 0, 'YXZ')
+      const rotMat = new THREE.Matrix4()
+      const solverOrientationSamples = makeOrientationSamples(30)
+      const animationOrientationSamples = makeOrientationSamples(15)
+
+      ////////////////////////////////////////////////////////////
+      // UI
+      ////////////////////////////////////////////////////////////
+
+      function addSegment(type, data) {
+        userSegments.push({
+          type,
+          data,
+        })
+
+        renderSegments()
+        rebuildScene()
+      }
+
+      document.getElementById('addDoor').onclick = () => {
+        addSegment('door', { width: 32, height: 84 })
+      }
+
+      document.getElementById('addHall').onclick = () => {
+        addSegment('hallway', { width: 36, height: 96, length: 120 })
+      }
+
+      document.getElementById('addTurn').onclick = () => {
+        addSegment('turn', { angle: 90, width: 36, height: 96 })
+      }
+
+      document.getElementById('addStair').onclick = () => {
+        addSegment('stair', {
+          width: 36,
+          rise: 7,
+          tread: 11,
+          steps: 14,
+          overhead: 96,
+          landingBefore: 36,
+          landingAfter: 36,
+        })
+      }
+
+      document.getElementById('addElevator').onclick = () => {
+        addSegment('elevator', {
+          doorWidth: 42,
+          doorHeight: 84,
+          width: 65,
+          depth: 98,
+          height: 96,
+        })
+      }
+
+      ////////////////////////////////////////////////////////////
+      // SEGMENT EDIT UI
+      ////////////////////////////////////////////////////////////
+
+      function renderSegments() {
+        const div = document.getElementById('segments')
+        div.innerHTML = ''
+
+        userSegments.forEach((s, i) => {
+          const d = document.createElement('div')
+          d.className = 'segment'
+
+          d.innerHTML = '<b>' + s.type + '</b><br>'
+
+          for (const k in s.data) {
+            d.innerHTML += `
+            ${k}: <input value="${s.data[k]}"
+            onchange="window.updateSegment(${i},'${k}',this.value)">
+            <br>
+            `
+          }
+
+          d.innerHTML += `<button onclick="window.removeSegment(${i})">Remove</button>`
+
+          div.appendChild(d)
+        })
+
+        updatePinchPointUI(computePinchPoints(buildPath()))
+      }
+
+      window.updateSegment = function (i, key, value) {
+        userSegments[i].data[key] = parseFloat(value)
+        renderSegments()
+        rebuildScene()
+      }
+
+      window.removeSegment = function (i) {
+        userSegments.splice(i, 1)
+        renderSegments()
+        rebuildScene()
+      }
+
+      ////////////////////////////////////////////////////////////
+      // PATH BUILDER
+      ////////////////////////////////////////////////////////////
+
+      function buildPath() {
+        const path = []
+
+        for (const s of userSegments) {
+          if (s.type === 'door') {
+            path.push({
+              type: 'opening',
+              width: s.data.width,
+              height: s.data.height,
+              depth: 4,
+            })
+          }
+
+          if (s.type === 'hallway') {
+            path.push({
+              type: 'corridor',
+              width: s.data.width,
+              height: s.data.height,
+              depth: s.data.length,
+            })
+          }
+
+          if (s.type === 'turn') {
+            path.push({
+              type: 'turn',
+              angle: s.data.angle,
+              width: s.data.width,
+              height: s.data.height,
+            })
+          }
+
+          if (s.type === 'stair') {
+            path.push({
+              type: 'stair',
+              width: s.data.width,
+              rise: s.data.rise,
+              tread: s.data.tread,
+              steps: s.data.steps,
+              overhead: s.data.overhead,
+              landingBefore: s.data.landingBefore,
+              landingAfter: s.data.landingAfter,
+            })
+          }
+
+          if (s.type === 'elevator') {
+            path.push({
+              type: 'opening',
+              width: s.data.doorWidth,
+              height: s.data.doorHeight,
+              depth: 6,
+            })
+
+            path.push({
+              type: 'box',
+              width: s.data.width,
+              height: s.data.height,
+              depth: s.data.depth,
+            })
+          }
+        }
+
+        return path
+      }
+
+      ////////////////////////////////////////////////////////////
+      // SOLVER
+      ////////////////////////////////////////////////////////////
+
+      function makeOrientationSamples(stepDeg) {
+        const samples = []
+
+        for (let yaw = 0; yaw <= 180; yaw += stepDeg) {
+          for (let pitch = -90; pitch <= 90; pitch += stepDeg) {
+            for (let roll = 0; roll <= 180; roll += stepDeg) {
+              samples.push({
+                yaw: yaw * DEG,
+                pitch: pitch * DEG,
+                roll: roll * DEG,
+              })
+            }
+          }
+        }
+
+        return samples
+      }
+
+      function orientedExtents(box, yaw, pitch, roll) {
+        euler.set(pitch, yaw, roll)
+        rotMat.makeRotationFromEuler(euler)
+        const r = rotMat.elements
+
+        const hx = box.w / 2
+        const hy = box.h / 2
+        const hz = box.d / 2
+
+        const ex = 2 * (Math.abs(r[0]) * hx + Math.abs(r[4]) * hy + Math.abs(r[8]) * hz)
+        const ey = 2 * (Math.abs(r[1]) * hx + Math.abs(r[5]) * hy + Math.abs(r[9]) * hz)
+        const ez = 2 * (Math.abs(r[2]) * hx + Math.abs(r[6]) * hy + Math.abs(r[10]) * hz)
+
+        return { x: ex, y: ey, z: ez }
+      }
+
+      function withAnyOrientation(box, constraintFn, samples = solverOrientationSamples) {
+        for (const o of samples) {
+          const ext = orientedExtents(box, o.yaw, o.pitch, o.roll)
+
+          if (constraintFn(ext, o)) return true
+        }
+
+        return false
+      }
+
+      function findTurnSweep(
+        box,
+        turn,
+        headingStart = 0,
+        samples = solverOrientationSamples,
+        sweepSteps = 10
+      ) {
+        const angle = (turn.angle || 90) * DEG
+        let best = null
+        let bestScore = -Infinity
+
+        for (const o of samples) {
+          let ok = true
+          let minMargin = Infinity
+
+          for (let i = 0; i <= sweepSteps; i++) {
+            const t = i / sweepSteps
+            const heading = headingStart + angle * t
+            const ext = orientedExtents(box, heading + o.yaw - headingStart, o.pitch, o.roll)
+
+            // Junction model: inside an L-corner square of width x width, not a circular elbow.
+            const mW = Math.min(turn.width - ext.x, turn.width - ext.z)
+            const mH = turn.height - ext.y
+
+            minMargin = Math.min(minMargin, mW, mH)
+
+            if (mW < 0 || mH < 0) {
+              ok = false
+              break
+            }
+          }
+
+          if (!ok) continue
+
+          if (minMargin > bestScore) {
+            bestScore = minMargin
+            best = {
+              localYaw: o.yaw,
+              pitch: o.pitch,
+              roll: o.roll,
+              angle,
+              clearance: minMargin,
+            }
+          }
+        }
+
+        return best
+      }
+
+      function fitsOpening(box, open) {
+        return withAnyOrientation(box, (ext) => ext.x <= open.width && ext.y <= open.height)
+      }
+
+      function fitsTurn(box, turn) {
+        return !!findTurnSweep(box, turn, 0, solverOrientationSamples, 8)
+      }
+
+      function fitsBox(box, e) {
+        return withAnyOrientation(
+          box,
+          (ext) => ext.x <= e.width && ext.y <= e.height && ext.z <= e.depth
+        )
+      }
+
+      function fitsStair(box, stair) {
+        const run = stair.tread * stair.steps + stair.landingBefore + stair.landingAfter
+        const rise = stair.rise * stair.steps
+        const slope = Math.atan2(rise, Math.max(run, 0.001))
+
+        return withAnyOrientation(box, (ext, o) => {
+          if (ext.x > stair.width) return false
+
+          const onSlope = orientedExtents(box, o.yaw, o.pitch + slope, o.roll)
+
+          if (onSlope.y > stair.overhead || onSlope.x > stair.width) return false
+
+          if (stair.landingBefore > 0 && ext.z > stair.landingBefore) return false
+          if (stair.landingAfter > 0 && ext.z > stair.landingAfter) return false
+
+          return ext.y <= stair.overhead
+        })
+      }
+
+      function canTravel(box, path) {
+        let heading = 0
+
+        for (const seg of path) {
+          if (seg.type === 'opening') {
+            if (!fitsOpening(box, seg)) return false
+          }
+
+          if (seg.type === 'turn') {
+            const turnSweep = findTurnSweep(box, seg, heading, solverOrientationSamples, 8)
+            if (!turnSweep) return false
+            heading += turnSweep.angle
+          }
+
+          if (seg.type === 'box') {
+            if (!fitsBox(box, seg)) return false
+          }
+
+          if (seg.type === 'stair') {
+            if (!fitsStair(box, seg)) return false
+          }
+        }
+
+        return true
+      }
+
+      function computePinchPoints(path) {
+        let maxWidth = Infinity
+        let maxHeight = Infinity
+        let maxDiagonal = Infinity
+
+        for (const seg of path) {
+          if (seg.type === 'opening' || seg.type === 'corridor' || seg.type === 'turn') {
+            maxWidth = Math.min(maxWidth, seg.width)
+            maxHeight = Math.min(maxHeight, seg.height)
+            maxDiagonal = Math.min(
+              maxDiagonal,
+              Math.sqrt(seg.width * seg.width + seg.height * seg.height)
+            )
+          }
+
+          if (seg.type === 'box') {
+            maxWidth = Math.min(maxWidth, seg.width)
+            maxHeight = Math.min(maxHeight, seg.height)
+            maxDiagonal = Math.min(
+              maxDiagonal,
+              Math.sqrt(seg.width * seg.width + seg.depth * seg.depth)
+            )
+          }
+
+          if (seg.type === 'stair') {
+            const stairRun = seg.tread * seg.steps + seg.landingBefore + seg.landingAfter
+            maxWidth = Math.min(maxWidth, seg.width)
+            maxHeight = Math.min(maxHeight, seg.overhead)
+            maxDiagonal = Math.min(
+              maxDiagonal,
+              Math.sqrt(seg.width * seg.width + stairRun * stairRun)
+            )
+          }
+        }
+
+        if (!Number.isFinite(maxWidth)) maxWidth = 120
+        if (!Number.isFinite(maxHeight)) maxHeight = 120
+        if (!Number.isFinite(maxDiagonal)) maxDiagonal = 170
+
+        return { maxWidth, maxHeight, maxDiagonal }
+      }
+
+      function updatePinchPointUI(stats) {
+        document.getElementById('stats').innerHTML =
+          '<b>Pinch points</b><br>' +
+          'max width: ' +
+          stats.maxWidth.toFixed(1) +
+          '<br>' +
+          'max height: ' +
+          stats.maxHeight.toFixed(1) +
+          '<br>' +
+          'max diagonal: ' +
+          stats.maxDiagonal.toFixed(1)
+      }
+
+      function updateSolvedBoxUI(box, volume = null) {
+        if (!box) {
+          document.getElementById('boxResult').innerHTML = '<b>Box</b><br>not solved yet'
+          return
+        }
+
+        const volText = volume == null ? (box.w * box.h * box.d).toFixed(0) : volume.toFixed(0)
+
+        document.getElementById('boxResult').innerHTML =
+          '<b>Solved box</b><br>' +
+          'W × H × D: ' +
+          box.w.toFixed(1) +
+          ' × ' +
+          box.h.toFixed(1) +
+          ' × ' +
+          box.d.toFixed(1) +
+          '<br>' +
+          'volume: ' +
+          volText
+      }
+
+      ////////////////////////////////////////////////////////////
+      // MONTE CARLO SEARCH
+      ////////////////////////////////////////////////////////////
+
+      function solve() {
+        const path = buildPath()
+        const pinch = computePinchPoints(path)
+
+        updatePinchPointUI(pinch)
+
+        let best = { w: 10, h: 10, d: 10 }
+        let bestVol = 0
+
+        for (let i = 0; i < 18000; i++) {
+          const maxW = Math.max(10, pinch.maxWidth)
+          const maxH = Math.max(10, pinch.maxHeight)
+
+          const c = {
+            w: 10 + Math.random() * maxW,
+            h: 10 + Math.random() * maxH,
+            d: 10 + Math.random() * pinch.maxDiagonal,
+          }
+
+          const floorDiag = Math.sqrt(c.w * c.w + c.d * c.d)
+          if (floorDiag > pinch.maxDiagonal) continue
+
+          if (canTravel(c, path)) {
+            const vol = c.w * c.h * c.d
+
+            if (vol > bestVol) {
+              best = c
+              bestVol = vol
+            }
+          }
+        }
+
+        solvedBox = best
+        updateSolvedBoxUI(best, bestVol)
+        createTestBox(best)
+        travelSamples = buildTravelSamples(path, best)
+        startAnimation()
+      }
+
+      document.getElementById('solve').onclick = solve
+      document.getElementById('playAnim').onclick = () => {
+        if (!solvedBox) return
+        const path = buildPath()
+        travelSamples = buildTravelSamples(path, solvedBox)
+        startAnimation()
+      }
+
+      ////////////////////////////////////////////////////////////
+      // VISUALIZATION
+      ////////////////////////////////////////////////////////////
+
+      function headingDirection(heading) {
+        return new THREE.Vector3(Math.sin(heading), 0, Math.cos(heading))
+      }
+
+      function rightDirection(heading) {
+        return new THREE.Vector3(Math.cos(heading), 0, -Math.sin(heading))
+      }
+
+      function placeSegmentMesh(width, height, depth, heading, center) {
+        const geo = new THREE.BoxGeometry(width, height, depth)
+        const mat = new THREE.MeshBasicMaterial({
+          wireframe: true,
+          color: 0x222222,
+        })
+
+        const m = new THREE.Mesh(geo, mat)
+        m.rotation.y = heading
+        m.position.copy(center)
+
+        scene.add(m)
+        meshes.push(m)
+      }
+
+      function placeTurnMesh(turn, pivot, headingStart) {
+        const angle = (turn.angle || 90) * DEG
+        const width = turn.width
+        const height = turn.height
+        const dirA = headingDirection(headingStart)
+        const dirB = headingDirection(headingStart + angle)
+
+        const centerA = pivot.clone().addScaledVector(dirA, width / 2)
+        centerA.y += height / 2
+        placeSegmentMesh(width, height, width, headingStart, centerA)
+
+        const centerB = pivot.clone().addScaledVector(dirB, width / 2)
+        centerB.y += height / 2
+        placeSegmentMesh(width, height, width, headingStart + angle, centerB)
+      }
+
+      function buildTravelSamples(path, box) {
+        const samples = []
+        let pos = new THREE.Vector3(0, 0, 0)
+        let heading = 0
+
+        function pushSample(p, yaw, pitch = 0, roll = 0) {
+          samples.push({
+            pos: p.clone().add(new THREE.Vector3(0, box.h / 2, 0)),
+            yaw,
+            pitch,
+            roll,
+          })
+        }
+
+        pushSample(pos, heading, 0)
+
+        for (const seg of path) {
+          if (seg.type === 'opening' || seg.type === 'corridor' || seg.type === 'box') {
+            const length = seg.depth || 10
+            const dir = headingDirection(heading)
+            const steps = Math.max(8, Math.round(length / 8))
+
+            for (let i = 1; i <= steps; i++) {
+              const t = i / steps
+              const p = pos.clone().addScaledVector(dir, length * t)
+              pushSample(p, heading, 0, 0)
+            }
+
+            pos = pos.clone().addScaledVector(dir, length)
+            continue
+          }
+
+          if (seg.type === 'stair') {
+            const run = seg.tread * seg.steps + seg.landingBefore + seg.landingAfter
+            const rise = seg.rise * seg.steps
+            const slope = Math.atan2(rise, Math.max(run, 0.001))
+            const dir = headingDirection(heading)
+            const steps = Math.max(14, Math.round(run / 8))
+
+            for (let i = 1; i <= steps; i++) {
+              const t = i / steps
+              const p = pos.clone().addScaledVector(dir, run * t)
+              p.y += rise * t
+              pushSample(p, heading, -slope, 0)
+            }
+
+            pos = pos.clone().addScaledVector(dir, run)
+            pos.y += rise
+            continue
+          }
+
+          if (seg.type === 'turn') {
+            const sweep =
+              findTurnSweep(box, seg, heading, animationOrientationSamples, 24) ||
+              findTurnSweep(box, seg, heading, solverOrientationSamples, 12)
+
+            const angle = sweep ? sweep.angle : (seg.angle || 90) * DEG
+            const steps = Math.max(16, Math.round(Math.abs(angle) / (5 * DEG)))
+
+            for (let i = 1; i <= steps; i++) {
+              const t = i / steps
+              const a = angle * t
+              const yaw = heading + a + (sweep ? sweep.localYaw : 0)
+              const pitch = sweep ? sweep.pitch : 0
+              const roll = sweep ? sweep.roll : 0
+              pushSample(pos, yaw, pitch, roll)
+            }
+
+            heading += angle
+          }
+        }
+
+        return samples
+      }
+
+      function startAnimation() {
+        if (!testBox || travelSamples.length < 2) return
+        animating = true
+        animStart = performance.now()
+        animDurationMs = Math.max(5000, travelSamples.length * 26)
+      }
+
+      function updateAnimation(now) {
+        if (!animating || !testBox || travelSamples.length < 2) return
+
+        const t = (now - animStart) / animDurationMs
+        const done = t >= 1
+        const clamped = Math.min(1, Math.max(0, t))
+        const f = clamped * (travelSamples.length - 1)
+        const i0 = Math.floor(f)
+        const i1 = Math.min(travelSamples.length - 1, i0 + 1)
+        const blend = f - i0
+
+        const a = travelSamples[i0]
+        const b = travelSamples[i1]
+
+        testBox.position.lerpVectors(a.pos, b.pos, blend)
+        testBox.rotation.order = 'YXZ'
+        testBox.rotation.y = THREE.MathUtils.lerp(a.yaw, b.yaw, blend)
+        testBox.rotation.x = THREE.MathUtils.lerp(a.pitch, b.pitch, blend)
+        testBox.rotation.z = THREE.MathUtils.lerp(a.roll || 0, b.roll || 0, blend)
+
+        if (done) animating = false
+      }
+
+      function clearMeshes() {
+        meshes.forEach((m) => scene.remove(m))
+        meshes = []
+      }
+
+      function rebuildScene() {
+        clearMeshes()
+
+        const path = buildPath()
+
+        let pos = new THREE.Vector3(0, 0, 0)
+        let heading = 0
+
+        for (const seg of path) {
+          if (seg.type === 'stair') {
+            const run = seg.tread * seg.steps + seg.landingBefore + seg.landingAfter
+            const rise = seg.rise * seg.steps
+            const slope = Math.atan2(rise, Math.max(run, 0.001))
+            const dir = headingDirection(heading)
+
+            const clearCenter = pos
+              .clone()
+              .addScaledVector(dir, run / 2)
+              .add(new THREE.Vector3(0, seg.overhead / 2 + rise / 2, 0))
+
+            placeSegmentMesh(seg.width, seg.overhead, run, heading, clearCenter)
+
+            const rampGeo = new THREE.BoxGeometry(seg.width * 0.9, 2, run)
+            const rampMat = new THREE.MeshStandardMaterial({
+              color: 0x4466aa,
+              transparent: true,
+              opacity: 0.35,
+            })
+            const ramp = new THREE.Mesh(rampGeo, rampMat)
+
+            ramp.position.copy(pos.clone().addScaledVector(dir, run / 2))
+            ramp.position.y += Math.max(1, rise / 2)
+            ramp.rotation.y = heading
+            ramp.rotation.x = -slope
+
+            scene.add(ramp)
+            meshes.push(ramp)
+
+            pos = pos.addScaledVector(dir, run)
+            pos.y += rise
+            continue
+          }
+
+          if (seg.type === 'turn') {
+            const angle = (seg.angle || 90) * DEG
+            placeTurnMesh(seg, pos, heading)
+            heading += angle
+            continue
+          }
+
+          if (seg.width) {
+            const depth = seg.depth || 10
+            const dir = headingDirection(heading)
+            const center = pos.clone().addScaledVector(dir, depth / 2)
+            center.y += seg.height / 2
+
+            placeSegmentMesh(seg.width, seg.height, depth, heading, center)
+
+            pos = pos.addScaledVector(dir, depth)
+          }
+        }
+
+        updatePinchPointUI(computePinchPoints(path))
+
+        if (solvedBox) {
+          travelSamples = buildTravelSamples(path, solvedBox)
+          updateSolvedBoxUI(solvedBox)
+        } else {
+          updateSolvedBoxUI(null)
+        }
+      }
+
+      ////////////////////////////////////////////////////////////
+      // BOX VISUAL
+      ////////////////////////////////////////////////////////////
+
+      function createTestBox(box) {
+        if (testBox) scene.remove(testBox)
+
+        const geo = new THREE.BoxGeometry(box.w, box.h, box.d)
+
+        const mat = new THREE.MeshStandardMaterial({
+          color: 0x44aa88,
+          transparent: true,
+          opacity: 0.72,
+          metalness: 0.15,
+          roughness: 0.45,
+        })
+
+        testBox = new THREE.Mesh(geo, mat)
+        testBox.position.set(0, box.h / 2, 0)
+
+        scene.add(testBox)
+      }
+
+      ////////////////////////////////////////////////////////////
+      // LOOP
+      ////////////////////////////////////////////////////////////
+
+      rebuildScene()
+
+      function animate() {
+        requestAnimationFrame(animate)
+        updateAnimation(performance.now())
+        controls.update()
+        renderer.render(scene, camera)
+      }
+
+      animate()
+
+      window.addEventListener('resize', () => {
+        camera.aspect = innerWidth / innerHeight
+        camera.updateProjectionMatrix()
+        renderer.setSize(innerWidth, innerHeight)
+      })
+    </script>
+  </body>
+</html>
